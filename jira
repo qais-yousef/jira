@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+#
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Author: Qais Yousef <qyousef@layalina.io>
+
+import configparser
+import jira
+import getpass
+import os
+import stat
+import json
+import textwrap
+import urwid
+
+#
+# Config info
+#
+CONFIG_PATH=os.path.expanduser('~/.jira')
+CONFIG_FILE=os.path.join(CONFIG_PATH, 'config')
+FILTERS_FILE=os.path.join(CONFIG_PATH, 'filters')
+
+if not os.path.exists(CONFIG_PATH):
+    os.makedirs(CONFIG_PATH)
+
+
+###############################################
+#
+# Version class manages the version of the
+# script and updating to latest version if:
+#
+#   * Force update if Major is different
+#   * Warn to update if Minor is different
+#
+###############################################
+class Version:
+    def __init__(self):
+        self.major = 0
+        self.minor = 1
+        self.rc = '-alpha'
+
+        self.version = '{}.{}{}'.format(self.major, self.minor, self.rc)
+
+        #self.print_version()
+        #self.check_new_version()
+
+    def print_version(self):
+        print("jira v{}".format(self.version))
+
+    def print_update_msg(self, major, minor):
+        print()
+        print("############################################")
+        print(" A new version is available v{}.{}".format(major, minor))
+        print(" Run `jira --update` to update")
+        print("############################################")
+        print()
+
+    def check_new_version(self):
+        r = requests.get(VERSION_LINK)
+        r = r.json()
+        major = r['Major']
+        minor = r['Minor']
+
+        if self.major < major:
+            self.print_update_msg(major, minor)
+            raise Exception("Must update to the latest version!")
+
+        if self.minor < minor:
+            self.print_update_msg(major, minor)
+
+    def create_version_json(self):
+        with open("version", 'w') as fp:
+            version = {}
+            version['Major'] = self.major
+            version['Minor'] = self.minor
+
+            json.dump(version, fp)
+
+    def update(self):
+        p = os.path.abspath(__file__)
+        r = requests.get(DOWNLOAD_LINK)
+        with open(p, 'w') as fp:
+            fp.write(r.text)
+
+
+###############################################
+#
+# Config class manages user configuration file
+#
+###############################################
+class Config:
+    # Public functions
+    def get_url(self):
+        return self.config.get('jira', 'url')
+
+    def get_username(self):
+        return self.config.get('user', 'username')
+
+    def get_pass(self):
+        return self.config.get('user', 'pass')
+
+    def get_email(self):
+        return self.config.get('user', 'email')
+
+    # Private functions
+    def read_username(self):
+        print('Jira username: ')
+        username = input()
+        self.config.set('user', 'username', username)
+
+    def read_pass(self):
+        print('Jira pass: ')
+        token = getpass.getpass()
+        self.config.set('user', 'pass', token)
+
+    def read_email(self):
+        print('Email: ')
+        token = input()
+        self.config.set('user', 'email', token)
+
+    def read_url(self):
+        print('Jira url: ')
+        url = input()
+
+        if url:
+            self.config.set('jira', 'url', url)
+
+    # Initialize everything
+    def __init__(self):
+        self.config = configparser.ConfigParser()
+
+        if os.path.isfile(CONFIG_FILE):
+            self.config.read(CONFIG_FILE)
+
+        if not self.config.has_section('user'):
+            self.config.add_section('user')
+            print('No user configuration found')
+            self.read_username()
+            self.read_pass()
+            self.read_email()
+        else:
+            if not self.config.has_option('user', 'username'):
+                print('Missing jira username')
+                self.read_username()
+            if not self.config.has_option('user', 'pass'):
+                print('Missing jira pass')
+                self.read_pass()
+            if not self.config.has_option('user', 'email'):
+                print('Missing pass email')
+                self.read_email()
+
+        if not self.config.has_section('jira'):
+            self.config.add_section('jira')
+            print('No jira configuration found')
+            self.read_url()
+        else:
+            if not self.config.has_option('jira', 'url'):
+                print('Missing jira url')
+                self.read_url()
+
+        with open(CONFIG_FILE, 'w') as config_file:
+            self.config.write(config_file)
+
+        # Since we store the password in plaintext, protect it so that only
+        # the owner can read it
+        os.chmod(CONFIG_FILE, stat.S_IRUSR | stat.S_IWUSR)
+
+
+###############################################
+#
+# JiraUrwid class implements talking to and
+# parsing Jira responses.
+#
+###############################################
+class JiraUrwid:
+    def __init__(self):
+        self.version = Version()
+        self.config = Config()
+        self.connect()
+
+    def version_json(self):
+        self.version.create_version_json()
+
+    def update(self):
+        self.version.update()
+
+    def connect(self):
+        self.jira = jira.JIRA(self.config.get_url(),
+                              auth=(self.config.get_username(),
+                                    self.config.get_pass()))
+
+    def __wrap(self, str):
+        return str
+        return textwrap.fill(str, 80,
+                             replace_whitespace=False,
+                             drop_whitespace=False,
+                             expand_tabs=False)
+
+    def card(self, head, body, card_attr, body_attr):
+        # Padding Text
+        pad = urwid.Text('')
+        lpad = 3
+        rpad = 5
+
+        # Set the Head Tagging Card
+        head = urwid.Text(head)
+        (cols, rows) = head.pack()
+
+        head = urwid.LineBox(head, tline='.', trcorner='.', tlcorner='.',
+                        lline='|', rline='|', bline='', blcorner='.', brcorner='.')
+
+        headbox = urwid.Columns([(lpad, pad), (cols+2, head), pad])
+        headbox = urwid.AttrWrap(headbox, card_attr)
+
+        # Set the Body Card
+        if isinstance(body, str):
+            body = urwid.Text(body)
+            body = urwid.AttrWrap(body, body_attr)
+        else:
+            body = urwid.Pile(body)
+            body = urwid.AttrWrap(body, body_attr)
+
+        body = urwid.LineBox(body, tline='.', trcorner='.', tlcorner='.',
+                        lline='.', rline='.', bline='.', blcorner='.', brcorner='.')
+
+        bodybox = urwid.Columns([(lpad, pad), body, (rpad, pad)])
+        bodybox = urwid.AttrWrap(bodybox, card_attr)
+
+        # Return everything as a pile
+        return urwid.Pile([headbox, bodybox])
+
+    def format_issue_str(self, issue, action):
+        view = []
+        description = []
+        comments = []
+
+        # Pad and empty line text
+        p = urwid.Text('')
+
+        description.append(p)
+
+        # Description Box
+        t = urwid.Text(issue.fields.summary)
+        t = urwid.AttrWrap(t, 'summary')
+        t = urwid.Columns([(3, p), t])
+        description.append(t)
+
+        description.append(urwid.Divider('_'))
+        description.append(p)
+
+        def field(field, value, newline='\n'):
+            return '{:15.15s}: {}{}'.format(field, value, newline)
+
+        t = field('Created', issue.fields.created)
+        t += field('Updated', issue.fields.updated)
+
+        try:
+            t += field('Assignee',  issue.fields.assignee.displayName)
+        except:
+            t += field('Assignee', 'None')
+
+        t += field('Reporter', issue.fields.reporter.displayName)
+        t += field('Type: ', issue.fields.issuetype.name)
+
+        components = ''
+        for component in issue.fields.components:
+            components += component.name + ' '
+        t += field('Components', components)
+
+        labels = ''
+        for label in issue.fields.labels:
+            labels += label + ' '
+        t += field('Labels', labels)
+
+        try:
+            t += field('Resolution: ', issue.fields.resolution.name)
+        except:
+            t += field('Resolution', 'None')
+
+        t += field('Status', issue.fields.status.name)
+        t += field('Priority', issue.fields.priority.name, newline='')
+
+        t = self.card('Info', t, 'summary', 'description')
+        description.append(t)
+
+        description.append(p)
+
+        try:
+            t = self.card('Description', self.__wrap(issue.fields.description.replace('\r\n', '\n')), 'summary', 'description')
+        except:
+            t = p
+        t = urwid.AttrWrap(t, 'description')
+        description.append(t)
+
+        description.append(p)
+
+        # Get a list of issues that are linked 'inward'
+        t = []
+        for il in issue.fields.issuelinks:
+            tt = ''
+            try:
+                tt += '{:<20.20s}'.format(il.type.inward)
+                tt += (': ' +
+                       '{:<15.15s}'.format(il.inwardIssue.key) +
+                       '{:<20.20s}'.format(il.inwardIssue.fields.status.name) +
+                       '{:<70.65s}'.format(il.inwardIssue.fields.summary) +
+                       '{:<45.45s}'.format(il.inwardIssue.permalink())
+                      )
+            except:
+                tt = ''
+
+            if tt:
+                tt = urwid.Button(tt, action, il.inwardIssue.key)
+                #tt = urwid.AttrWrap(tt, 'button normal', 'button select')
+                t.append(tt)
+
+        # Get a list of issues that are linked 'outward'
+        for il in issue.fields.issuelinks:
+            tt = ''
+            try:
+                tt += '{:<20.20s}'.format(il.type.outward)
+                tt += (': ' +
+                       '{:<15.15s}'.format(il.outwardIssue.key) +
+                       '{:<20.20s}'.format(il.outwardIssue.fields.status.name) +
+                       '{:<70.65s}'.format(il.outwardIssue.fields.summary) +
+                       '{:<45.45s}'.format(il.outwardIssue.permalink())
+                      )
+            except:
+                tt = ''
+
+            if tt:
+                tt = urwid.Button(tt, action, il.outwardIssue.key)
+                #tt = urwid.AttrWrap(tt, 'button normal', 'button select')
+                t.append(tt)
+
+        # List Linked Issues if any..
+        if len(t):
+            t = self.card('Issue Links', t, 'summary', 'description')
+            description.append(t)
+            description.append(p)
+
+        # Get a list of attachments
+        t = ''
+        for attached in issue.fields.attachment:
+            t += attached.content + '\n'
+
+        # List attchemnts if any..
+        if t:
+            t = t.rstrip('\n')
+            t = self.card('Attachments', t, 'summary', 'description')
+            description.append(t)
+            description.append(p)
+
+        # Get a list of subtasks
+        t = []
+        for subtask in issue.fields.subtasks:
+            tt = ''
+            try:
+                tt += (
+                       '{:<15.15s}'.format(subtask.key) +
+                       '{:<20.20s}'.format(subtask.fields.status.name) +
+                       '{:<70.65s}'.format(subtask.fields.summary) +
+                       '{:<45.45s}'.format(subtask.permalink())
+                      )
+            except:
+                tt = ''
+
+            if tt:
+                tt = urwid.Button(tt, action, subtask.key)
+                #tt = urwid.AttrWrap(tt, 'button normal', 'button select')
+                t.append(tt)
+
+        # List Linked Issues if any..
+        if len(t):
+            t = self.card('Sub-Tasks', t, 'summary', 'description')
+            description.append(t)
+            description.append(p)
+
+        description = urwid.Pile(description)
+        description = urwid.LineBox(description, title=issue.key, title_align='left')
+        view.append(description)
+
+        # Comments Box
+        comments.append(p)
+
+        total = len(issue.fields.comment.comments)
+
+        i = 0
+        for comment in issue.fields.comment.comments:
+
+            if i % 2 == 0:
+                attr = 'comment_box_a'
+            else:
+                attr = 'comment_box_b'
+            i += 1
+
+            head = comment.author.displayName + ' @' + comment.created
+            body = '\n' + self.__wrap(comment.body.replace('\r\n', '\n')) + '\n'
+            t = self.card(head, body, attr, 'comment body')
+            comments.append(t)
+
+            comments.append(p)
+
+        comments.append(p)
+
+        comments = urwid.Pile(comments)
+        comments = urwid.LineBox(comments, title='Comments ({})'.format(total), title_align='left')
+        view.append(comments)
+
+        return view
+
+    def view_issue(self, issue, action):
+        issue = self.jira.issue(issue)
+        view = self.format_issue_str(issue, action)
+        return view
+
+    def list_issues(self, filter, action):
+        issues = self.jira.search_issues(filter, maxResults=False)
+        text = []
+
+        total = len(issues)
+
+        for issue in issues:
+            try:
+                assignee = '{:<10.10s}'.format(issue.fields.assignee.displayName.split()[0])
+            except:
+                assignee = '{:<10.10s}'.format('None')
+
+            button = urwid.Button(
+                          ' ' + '{:<15.15s}'.format(issue.key) +
+                          ' ' + assignee +
+                          ' ' + '{:<20.20s}'.format(issue.fields.status.name) +
+                          ' ' + '{:<70.65s}'.format(issue.fields.summary) +
+                          ' ' + '{:<45.45s}'.format(issue.permalink()) +
+                          ' ' + issue.fields.updated.split('T')[0],
+
+                          action,
+                          issue.key
+                        )
+
+            button = urwid.AttrWrap(button, 'button normal', 'button select')
+            text.append(button)
+
+        return (text, total)
+
+    def get_filters_list(self):
+        list = []
+
+        if os.path.exists(FILTERS_FILE) and os.path.getsize(FILTERS_FILE):
+            with open(FILTERS_FILE) as fd:
+                filters = json.load(fd)
+        else:
+            with open(FILTERS_FILE, 'w') as fd:
+                filters = {}
+                filters['order_by'] = 'order by assignee ASC, status ASC, updated DESC'
+                filters['filters'] = [{
+                                        'name': 'My Issues',
+                                        'filter' : 'assignee = currentUser() AND status != closed'
+                                     }]
+                json.dump(filters, fd, indent=4)
+
+        for filter in filters['filters']:
+            try:
+                order_by = filter['order_by']
+            except:
+                order_by = filters['order_by']
+
+            list.append((filter['name'], filter['filter'] + ' ' + order_by))
+
+        return list
+
+
+###############################################
+#
+# App class handle user command line options
+# and executes what they asked us to do.
+#
+###############################################
+class App:
+    def __init__(self):
+        self.jstatus = JiraUrwid()
+
+        self.palette = [
+            ('button normal', ''             , ''          ),
+            ('button select', 'white'        , 'dark green'),
+            ('edit normal'  , ''             , ''          ),
+            ('edit focus'   , 'white'        , 'dark green'),
+            ('summary'      , 'yellow'       , ''          ),
+            ('description'  , ''             , ''          ),
+            ('comment_box_a', 'light magenta', ''          ),
+            ('comment_box_b', 'light cyan'   , ''          ),
+            ('comment head' , 'yellow'       , ''          ),
+            ('comment body' , ''             , ''          ),
+            ]
+
+        self.footer_text = [
+            ('title', "Jira"), "  |  ",
+            ('key', "UP (k)"), ", ", ('key', "DOWN (j)"), ", ",
+            ('key', "PAGE UP (CTRL u)"), " and ", ('key', "PAGE DOWN (CTRL d)"),
+            " move view", "  |  ",
+            ('key', "F"), " focus Filters", "  |  ",
+            ('key', "f"), " focus Filter", "  |  ",
+            ('key', "V"), " focus View Issue", "  |  ",
+            ('key', "I"), " focus Issues", "  |  ",
+            ('key', "Q"), " exits",
+            ]
+
+    def run(self):
+
+        def key_handler(input):
+            if type(input) is not str:
+                return
+
+            elif input in ('q', 'Q'):
+                if self.loop.widget == self.frame:
+                    raise urwid.ExitMainLoop()
+                elif len(self.framestack):
+                    self.loop.widget = self.framestack.pop()
+                else:
+                    self.loop.widget = self.frame
+
+            elif input in ('enter'):
+                if self.editboxcols.get_focus() == self.filterbox:
+                    view_filter(None, self.edit_filter.get_edit_text())
+
+                elif self.editboxcols.get_focus() == self.issuebox:
+                    view_issue(None, self.edit_issue.get_edit_text())
+
+            elif input in ('F'):
+                self.pile.set_focus(self.listfilter)
+
+            elif input in ('I'):
+                self.pile.set_focus(self.listview)
+
+            elif input in ('f'):
+                self.pile.set_focus(self.editbox)
+                self.editboxcols.set_focus(self.filterbox)
+
+            elif input in ('V'):
+                self.pile.set_focus(self.editbox)
+                self.editboxcols.set_focus(self.issuebox)
+
+        def view_issue(button, issue):
+            try:
+                issue = self.jstatus.view_issue(issue, view_issue)
+            except:
+                return
+            l= urwid.ListBox(urwid.SimpleListWalker(issue))
+            frame = urwid.Frame(urwid.AttrWrap(l, 'body'), footer=self.footer)
+            self.framestack.append(self.loop.widget)
+            self.loop.widget = frame
+
+        def view_filter(button, filter):
+            try:
+                (text, total) = self.jstatus.list_issues(filter, view_issue)
+            except:
+                return
+            l = urwid.ListBox(urwid.SimpleListWalker(text))
+            self.edit_filter.set_edit_text(filter)
+            self.listview = urwid.LineBox(l, 'Issues ({})'.format(total), title_align='left')
+            update_frame()
+            self.pile.set_focus(self.listview)
+
+        def create_filters_list():
+            text = []
+            for (name, filter) in self.jstatus.get_filters_list():
+                button = urwid.Button(name, view_filter, filter)
+                button = urwid.AttrWrap(button, 'button normal', 'button select')
+                text.append(button)
+
+            return text
+
+        def update_frame():
+            self.pile = urwid.Pile([(10, self.listfilter), (4, self.editbox), self.listview])
+            self.frame = urwid.Frame(urwid.AttrWrap(self.pile, 'body'), footer=self.footer)
+            self.loop.widget = self.frame
+
+        def add_vim_binding():
+            self.frame._command_map['j'] = 'cursor down'
+            self.frame._command_map['ctrl n'] = 'cursor down'
+            self.frame._command_map['k'] = 'cursor up'
+            self.frame._command_map['ctrl p'] = 'cursor up'
+            self.frame._command_map['g'] = 'cursor max left'
+            self.frame._command_map['G'] = 'cursor max right'
+            self.frame._command_map['ctrl u'] = 'cursor page up'
+            self.frame._command_map['ctrl d'] = 'cursor page down'
+
+        l = create_filters_list()
+        l = urwid.ListBox(urwid.SimpleListWalker(l))
+        self.listfilter = urwid.LineBox(l, 'Filters', title_align='left')
+        l = urwid.ListBox(urwid.SimpleListWalker([]))
+        self.listview = urwid.LineBox(l, 'Issues', title_align='left')
+
+        self.edit_filter = urwid.Edit('', '')
+        self.edit_filter = urwid.AttrWrap(self.edit_filter, 'edit normal', 'edit focus')
+        self.filterbox = urwid.LineBox(self.edit_filter, 'Filter', title_align='left',
+                                    bline='', blcorner='', brcorner='')
+
+        self.edit_issue = urwid.Edit('', '')
+        self.edit_issue = urwid.AttrWrap(self.edit_issue, 'edit normal', 'edit focus')
+        self.issuebox = urwid.LineBox(self.edit_issue, 'View Issue', title_align='left',
+                                    bline='', blcorner='', brcorner='')
+
+        self.editboxcols = urwid.Columns([self.filterbox, self.issuebox])
+        self.editbox = urwid.ListBox(urwid.SimpleListWalker([self.editboxcols]))
+
+        self.pile = urwid.Pile([(10, self.listfilter), (4, self.editbox), self.listview])
+        self.footer = urwid.AttrMap(urwid.Text(self.footer_text), 'foot')
+        self.frame = urwid.Frame(urwid.AttrWrap(self.pile, 'body'), footer=self.footer)
+        self.loop = urwid.MainLoop(self.frame, self.palette, unhandled_input=key_handler)
+
+        self.framestack = []
+        add_vim_binding()
+
+        self.loop.run()
+
+
+###############################################
+#
+#          ## APP START HERE ###
+#
+###############################################
+if __name__=="__main__":
+    app = App()
+    app.run()
